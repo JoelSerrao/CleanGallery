@@ -1,182 +1,132 @@
 import os
-import shutil
-import csv
-import hashlib
-import subprocess
+import json
 from pathlib import Path
-from collections import defaultdict
-
+from PIL import Image
 import torch
 import clip
-from PIL import Image
-import imagehash
+import numpy as np
 from tqdm import tqdm
 
-# Configuration
+# ================= CONFIG =================
 
-ROOT_DIR = Path(r"F:\Projects\CleanGallery\Folders to get images")        # Path of the images to clean
-REVIEW_DIR = Path(r"F:\Projects\CleanGallery\cleanup_review")
-HASH_THRESHOLD = 3
-MIN_FILE_SIZE_KB = 1                     # Minimum file size to consider (in KB)
+Dir = Path("F:\Projects\CleanGallery\Folders to get images")        # Path of the images to clean
+Output_JSON = Path("image_index.json")
+Min_Size = 1                     # Minimum file size to consider (in KB)
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-CLIP_LABELS = [
-    "a photograph",
-    "an internet meme with text",
-    "a screenshot of a phone or computer screen",
-    "a scanned document",
-    "a computer user interface"
+SOURCE_LABELS = [
+    "a photograph taken with a camera",
+    "a screenshot of a phone or computer screen"
 ]
 
-# Utilities
+CONTENT_LABELS = [
+    "an internet meme with text",
+    "a scanned document",
+    "a computer user interface",
+    "a photograph"
+]
 
-def open_image(path):
-    if os.name == "nt":
-        os.startfile(path)
-    elif os.name == "posix":
-        subprocess.run(["xdg-open", str(path)], check=False)
+DUPLICATE_THRESHOLD = 0.95
+CONFIDENCE_MIN = 0.65
+CONFIDENCE_MARGIN = 0.15
 
-def image_resolution(path):
-    try:
-        with Image.open(path) as img:
-            return img.width * img.height
-    except:
-        return 0
+# ================= LOAD CLIP =================
 
-# 1. Scan for images
+model, preprocess = clip.load("ViT-B/32", device=DEVICE)
+model.eval()
+
+def encode_text(labels):
+    tokens = clip.tokenize(labels).to(DEVICE)
+    with torch.no_grad():
+        emb = model.encode_text(tokens)
+        emb /= emb.norm(dim=-1, keepdim=True)
+    return emb
+
+SOURCE_TEXT = encode_text(SOURCE_LABELS)
+CONTENT_TEXT = encode_text(CONTENT_LABELS)
+
+# ================= UTILS =================
 
 def scan_images(root):
-    images = []
-    for path in root.rglob("*"):
-        if path.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"}:
-            if path.stat().st_size >= MIN_FILE_SIZE_KB * 1024:
-                images.append(path)
-    return images
+    exts = {".jpg", ".jpeg", ".png", ".webp"}
+    for p in root.rglob("*"):
+        if p.suffix.lower() in exts and p.stat().st_size > Min_Size * 1024:
+            yield p
 
-# 2. Perceptual Hashing
-
-def compute_hashes(paths):
-    hashes = {}
-    for p in tqdm(paths, desc="Computing pHash"):
-        try:
-            with Image.open(p) as img:
-                hashes[p] = imagehash.phash(img)
-        except:
-            continue
-    return hashes
-
-def group_duplicates(hashes):
-    groups = []
-    used = set()
-    items = list(hashes.items())
-
-    for i, (p1, h1) in enumerate(items):
-        if p1 in used:
-            continue
-        group = [p1]
-        for p2, h2 in items[i + 1:]:
-            if p2 in used:
-                continue
-            if abs(h1 - h2) <= HASH_THRESHOLD:
-                group.append(p2)
-        if len(group) > 1:
-            used.update(group)
-            groups.append(group)
-
-    return groups
-
-# 3. CLIP Classification
-
-def load_clip():
-    model, preprocess = clip.load("ViT-B/32", device=DEVICE)
-    text = clip.tokenize(CLIP_LABELS).to(DEVICE)
-    return model, preprocess, text
-
-def classify_image(path, model, preprocess, text_tokens):
-    image = preprocess(Image.open(path).convert("RGB")).unsqueeze(0).to(DEVICE)
+def encode_image(path):
+    img = preprocess(Image.open(path).convert("RGB")).unsqueeze(0).to(DEVICE)
     with torch.no_grad():
-        image_features = model.encode_image(image)
-        text_features = model.encode_text(text_tokens)
-        similarity = (image_features @ text_features.T).softmax(dim=-1)
-    idx = similarity.argmax().item()
-    return CLIP_LABELS[idx], similarity[0][idx].item()
+        emb = model.encode_image(img)
+        emb /= emb.norm(dim=-1, keepdim=True)
+    return emb.cpu().numpy()[0]
 
-# 4. Review and Cleanup
+def classify(emb, text_emb, labels):
+    sims = emb @ text_emb.T
+    top = np.argsort(-sims)
+    best, second = top[0], top[1]
+    confidence = sims[best]
+    margin = sims[best] - sims[second]
+    status = "ok"
+    if confidence < CONFIDENCE_MIN or margin < CONFIDENCE_MARGIN:
+        status = "uncertain"
+    return {
+        "label": labels[best],
+        "confidence": float(confidence),
+        "margin": float(margin),
+        "status": status
+    }
 
-def prepare_review_dirs():
-    for sub in ["duplicates", "memes", "screenshots", "documents"]:
-        (REVIEW_DIR / sub).mkdir(parents=True, exist_ok=True)
+# ================= MAIN =================
 
-def move_for_review(path, category):
-    target = REVIEW_DIR / category / path.name
-    shutil.copy2(path, target)
-    return target
+records = []
+embeddings = []
 
+paths = list(scan_images(Dir))
 
-def main():
-    REVIEW_DIR.mkdir(exist_ok=True)
+for p in tqdm(paths, desc="Encoding images"):
+    try:
+        emb = encode_image(p)
+        embeddings.append(emb)
 
-    images = scan_images(ROOT_DIR)
-    print(f"Found {len(images)} images")
+        source = classify(emb, SOURCE_TEXT, SOURCE_LABELS)
+        content = classify(emb, CONTENT_TEXT, CONTENT_LABELS)
 
-    hashes = compute_hashes(images)
-    duplicate_groups = group_duplicates(hashes)
+        records.append({
+            "path": str(p),
+            "embedding": emb.tolist(),
+            "source": source,
+            "content": content
+        })
+    except Exception as e:
+        print("Error:", p, e)
 
-    duplicates_to_review = []
-    for group in duplicate_groups:
-        best = max(group, key=image_resolution)
-        for p in group:
-            if p != best:
-                duplicates_to_review.append(p)
+# ================= DUPLICATES =================
 
-    model, preprocess, text_tokens = load_clip()
-    prepare_review_dirs()
+emb_matrix = np.array(embeddings)
+sim_matrix = emb_matrix @ emb_matrix.T
 
-    review_log = []
+duplicate_groups = []
+visited = set()
 
-    for img in tqdm(images, desc="Classifying"):
-        if img in duplicates_to_review:
-            moved = move_for_review(img, "duplicates")
-            review_log.append([img, moved, "duplicate", ""])
-            continue
+for i in range(len(records)):
+    if i in visited:
+        continue
+    group = [i]
+    for j in range(i + 1, len(records)):
+        if sim_matrix[i, j] > DUPLICATE_THRESHOLD:
+            group.append(j)
+            visited.add(j)
+    if len(group) > 1:
+        duplicate_groups.append(group)
+        visited.update(group)
 
-        label, score = classify_image(img, model, preprocess, text_tokens)
+for group in duplicate_groups:
+    for idx in group:
+        records[idx]["duplicate_group"] = group
 
-        if "meme" in label:
-            cat = "memes"
-        elif "screenshot" in label or "interface" in label:
-            cat = "screenshots"
-        elif "document" in label:
-            cat = "documents"
-        else:
-            continue
+with open(Output_JSON, "w", encoding="utf-8") as f:
+    json.dump(records, f, indent=2)
 
-        moved = move_for_review(img, cat)
-        review_log.append([img, moved, label, score])
-
-    # Save CSV
-    with open(REVIEW_DIR / "review.csv", "w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow(["original_path", "review_path", "reason", "confidence"])
-        writer.writerows(review_log)
-
-    print("\nReview phase starting...\n")
-
-    for original, review_path, reason, score in review_log:
-        print(f"\nOriginal: {original}")
-        print(f"Reason: {reason}  Confidence: {score}")
-        open_image(review_path)
-
-        resp = input("Delete this file? [y/N/q]: ").strip().lower()
-        if resp == "y":
-            os.remove(original)
-            print("Deleted.")
-        elif resp == "q":
-            print("Aborting review.")
-            break
-        else:
-            print("Skipped.")
-
-if __name__ == "__main__":
-    main()
+print(f"Indexed {len(records)} images")
+print(f"Found {len(duplicate_groups)} duplicate groups")
