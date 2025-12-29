@@ -1,16 +1,15 @@
-import os
-import json
 from pathlib import Path
 from PIL import Image
 import torch
 import clip
-import numpy as np
 from tqdm import tqdm
+import sqlite3
+import numpy as np
 
 # ================= CONFIG =================
 
-Dir = Path("F:\Projects\CleanGallery\Folders to get images")        # Path of the images to clean
-Output_JSON = Path("F:\Projects\CleanGallery\image_index.json")
+Dir = Path(r"F:\Projects\CleanGallery\Folders to get images")        # Path of the images to clean
+DB_path = Path(r"F:\Projects\CleanGallery\image_DB.db")               # Path to the image database
 Min_Size = 1                     # Minimum file size to consider (in KB)
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -27,11 +26,37 @@ CONTENT_LABELS = [
     "a photograph"
 ]
 
-DUPLICATE_THRESHOLD = 0.95
-CONFIDENCE_MIN = 0.65
-CONFIDENCE_MARGIN = 0.15
+CONF_MIN = 0.65
+CONF_MARGIN = 0.15
 
-# ================= LOAD CLIP =================
+# ================= DB =================
+
+conn = sqlite3.connect(DB_path)
+cur = conn.cursor()
+
+cur.execute("""
+CREATE TABLE IF NOT EXISTS images (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    path TEXT UNIQUE,
+    embedding BLOB,
+
+    source_label TEXT,
+    source_confidence REAL,
+    source_margin REAL,
+    source_status TEXT,
+
+    content_label TEXT,
+    content_confidence REAL,
+    content_margin REAL,
+    content_status TEXT,
+
+    duplicate_cluster INTEGER
+)
+""")
+
+conn.commit()
+
+# ================= CLIP =================
 
 model, preprocess = clip.load("ViT-B/32", device=DEVICE)
 model.eval()
@@ -48,99 +73,102 @@ CONTENT_TEXT = encode_text(CONTENT_LABELS)
 
 # ================= UTILS =================
 
-def scan_images(root):
+def to_blob(vec):
+    return vec.astype(np.float32).tobytes()
+
+def classify(emb_torch, text_emb, labels):
+    sims = (emb_torch @ text_emb.T).squeeze(0)
+
+    values, indices = torch.sort(sims, descending=True)
+    best = indices[0].item()
+
+    conf = values[0].item()
+    margin = (values[0] - values[1]).item()
+
+    status = "ok" if conf >= CONF_MIN and margin >= CONF_MARGIN else "uncertain"
+
+    return labels[best], conf, margin, status
+
+
+def scan_images():
     exts = {".jpg", ".jpeg", ".png", ".webp"}
-    for p in root.rglob("*"):
+    for p in Dir.rglob("*"):
         if p.suffix.lower() in exts and p.stat().st_size > Min_Size * 1024:
             yield p
 
-def encode_image(path):
-    img = preprocess(Image.open(path).convert("RGB")).unsqueeze(0).to(DEVICE)
-    with torch.no_grad():
-        emb = model.encode_image(img)
-        emb = emb / emb.norm(dim=-1, keepdim=True)
-    return emb.squeeze(0)   # Torch tensor
-
-def classify(image_emb, text_emb, labels):
-    # image_emb: [512]
-    # text_emb: [N, 512]
-    sims = (image_emb @ text_emb.T).softmax(dim=-1)
-
-    best = sims.argmax().item()
-    sorted_vals, _ = torch.sort(sims, descending=True)
-
-    confidence = sorted_vals[0].item()
-    margin = (sorted_vals[0] - sorted_vals[1]).item()
-
-    status = "ok"
-    if confidence < CONFIDENCE_MIN or margin < CONFIDENCE_MARGIN:
-        status = "uncertain"
-
-    return {
-        "label": labels[best],
-        "confidence": confidence,
-        "margin": margin,
-        "status": status
-    }
-
 # ================= MAIN =================
 
-records = []
-embeddings = []
-
-paths = list(scan_images(Dir))
-
-for p in tqdm(paths, desc="Encoding images"):
+for path in tqdm(list(scan_images()), desc="Indexing images"):
     try:
-        image_emb = encode_image(p)
+        img = preprocess(Image.open(path).convert("RGB")).unsqueeze(0).to(DEVICE)
+        with torch.no_grad():
+            emb_torch = model.encode_image(img)
+            emb_torch /= emb_torch.norm(dim=-1, keepdim=True)
 
-        source = classify(image_emb, SOURCE_TEXT, SOURCE_LABELS)
-        content = classify(image_emb, CONTENT_TEXT, CONTENT_LABELS)
+        s_label, s_conf, s_margin, s_status = classify(emb_torch, SOURCE_TEXT, SOURCE_LABELS)
+        c_label, c_conf, c_margin, c_status = classify(emb_torch, CONTENT_TEXT, CONTENT_LABELS)
 
-        # Store NumPy version for duplicates + JSON
-        emb_np = image_emb.cpu().numpy()
-        embeddings.append(emb_np)
+        emb_np = emb_torch.cpu().numpy()[0]
 
-        records.append({
-            "path": str(p),
-            "embedding": emb_np.tolist(),
-            "source": source,
-            "content": content
-        })
+        cur.execute("""
+        INSERT OR REPLACE INTO images
+        (path, embedding,
+         source_label, source_confidence, source_margin, source_status,
+         content_label, content_confidence, content_margin, content_status)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            str(path),
+            to_blob(emb_np),
+            s_label, s_conf, s_margin, s_status,
+            c_label, c_conf, c_margin, c_status
+        ))
 
     except Exception as e:
-        print("Error:", p, e)
+        print("Failed:", path, e)
 
-# ================= DUPLICATE DETECTION =================
+conn.commit()
+conn.close()
 
-emb_matrix = np.array(embeddings)
-sim_matrix = emb_matrix @ emb_matrix.T
+# ================= DUPLICATE CLUSTERING =================
+import sqlite3
+import numpy as np
+from sklearn.cluster import DBSCAN
 
-duplicate_groups = []
-visited = set()
+def from_blob(blob):
+    return np.frombuffer(blob, dtype=np.float32)
 
-for i in range(len(records)):
-    if i in visited:
-        continue
+conn = sqlite3.connect(DB_path)
+cur = conn.cursor()
 
-    group = [i]
-    for j in range(i + 1, len(records)):
-        if sim_matrix[i, j] > DUPLICATE_THRESHOLD:
-            group.append(j)
-            visited.add(j)
+cur.execute("SELECT id, embedding FROM images")
+rows = cur.fetchall()
 
-    if len(group) > 1:
-        duplicate_groups.append(group)
-        visited.update(group)
+ids = []
+embeddings = []
 
-for group in duplicate_groups:
-    for idx in group:
-        records[idx]["duplicate_group"] = group
+for img_id, blob in rows:
+    ids.append(img_id)
+    embeddings.append(from_blob(blob))
 
-# ================= SAVE =================
+X = np.vstack(embeddings)
 
-with open(Output_JSON, "w", encoding="utf-8") as f:
-    json.dump(records, f, indent=2)
+db = DBSCAN(
+    eps=0.05,
+    min_samples=2,
+    metric="cosine"
+)
 
-print(f"Indexed {len(records)} images")
-print(f"Found {len(duplicate_groups)} duplicate groups")
+labels = db.fit_predict(X)
+
+for img_id, label in zip(ids, labels):
+    if label >= 0:
+        cur.execute(
+            "UPDATE images SET duplicate_cluster=? WHERE id=?",
+            (int(label), img_id)
+        )
+
+conn.commit()
+conn.close()
+
+print("Duplicate clustering complete.")
+
